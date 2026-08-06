@@ -33,7 +33,7 @@
 
 using namespace scheduler;
 
-void scheduler::buildKTDPToDFIRPipeline(
+void scheduler::buildKTDPToScheduleIRPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   pm.addPass(createKTIRLegalityCheckPass());
   pm.addPass(createComputeGroupExtractionPass());
@@ -60,6 +60,11 @@ void scheduler::buildKTDPToDFIRPipeline(
   pm.addPass(createAffineMinCanonicalizationPass());
   pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
+}
+
+void scheduler::buildKTDPToDFIRPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  buildKTDPToScheduleIRPipeline(pm, scheduler_ctx);
   // TODO: position of cross-instance parallelization is TBD
   // pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
   pm.addPass(createNormalizeGridTo1DPass());

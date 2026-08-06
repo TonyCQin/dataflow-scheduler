@@ -33,6 +33,15 @@ namespace scheduler {
 
 struct SchedulerExtContext;
 
+/// Builds the KTDP to schedule IR (KTDFLow) pipeline, stopping before the
+/// final KTDFLowToDFIR conversion. Callers that want to inspect the schedule
+/// IR before it becomes DataflowIR can call this, insert a dump, then add
+/// createKTDFLowToDFIRPass() themselves. buildKTDPToDFIRPipeline calls this
+/// internally.
+void buildKTDPToScheduleIRPipeline(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx);
+
 /// Builds the KTDP to DFIR pipeline with the given pass manager.
 ///
 /// Note: this does not emit the DFIR output. Callers that want the resulting
