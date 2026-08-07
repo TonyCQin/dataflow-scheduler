@@ -46,11 +46,12 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
-#include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
+#include "dataflow-scheduler/Dialect/Dataflow/DataflowDialect.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLoweringDialect.h"
+#include "dataflow-scheduler/Dialect/Symbol/Symbol.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
@@ -78,12 +79,13 @@ void scheduler::registerDialects(mlir::DialectRegistry& registry) {
   registry.insert<mlir::ktdp::KtdpDialect>();
 
   // Register the dialects defined in the scheduler.
-  registry.insert<mlir::agen::AgenDialect, 
+  registry.insert<mlir::agen::AgenDialect,
                   mlir::dataflow::DataflowDialect,
-                  mlir::ktdf::KTDFDialect, 
+                  mlir::ktdf::KTDFDialect,
                   mlir::ktdf_arch::KTDFArchDialect,
                   mlir::ktdf_lowering::KTDFLoweringDialect,
-                  mlir::uniform::UniformDialect, 
+                  mlir::symbol::SymbolDialect,
+                  mlir::uniform::UniformDialect,
                   mlir::vectorchain::VectorChainDialect>();
 
   // clang-format on
