@@ -33,6 +33,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/NodeEndpoints.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
@@ -97,18 +98,22 @@ struct Candidate {
 // Analysis helpers
 //===----------------------------------------------------------------------===//
 
-/// Returns true if @p resource's SSA result is yielded by @p group, meaning
-/// the group acts as a named wrapper around the resource rather than a scope
-/// that encloses it as a peer.
-[[nodiscard]] auto isYieldedBy(mlir::ktdf_arch::Resource resource,
-                               mlir::ktdf_arch::GroupOp group) -> bool {
-  auto* terminator = group.getBody()->getTerminator();
-  auto yield = mlir::dyn_cast<mlir::ktdf_arch::YieldOp>(terminator);
-  if (!yield) {
-    return false;
+/// Returns true if @p group acts as a named alias for @p resource rather than
+/// a true enclosing scope.
+///
+/// A group is a named alias when at least one of its yielded results traces
+/// back (via endpoint analysis) to the same underlying Node as @p resource.
+/// This is transitive through any depth of nested groups, unlike a direct
+/// yield-operand check.
+[[nodiscard]] auto isAliasGroup(mlir::ktdf_arch::Resource resource,
+                                mlir::ktdf_arch::GroupOp group) -> bool {
+  auto target = resource->getResult(0);
+  for (auto result : group->getResults()) {
+    if (mlir::ktdf_arch::getEndpoint(result) == target) {
+      return true;
+    }
   }
-  auto result = resource->getResult(0);
-  return llvm::is_contained(yield.getOperands(), result);
+  return false;
 }
 
 [[nodiscard]] auto findEnclosingGroup(
@@ -129,10 +134,10 @@ struct Candidate {
     if (!group) {
       return nullptr;
     }
-    // If the group simply wraps and re-exports this resource via its yield,
-    // it acts as a named alias rather than a true enclosing scope.  Step past
-    // it so that the LCA search operates at the correct granularity.
-    if (isYieldedBy(resource, group)) {
+    // If the group is a transparent alias for this resource (its result traces
+    // back to the same Node endpoint), it is not a true enclosing scope.
+    // Step past it so that the LCA search operates at the correct granularity.
+    if (isAliasGroup(resource, group)) {
       group = group->getParentOfType<mlir::ktdf_arch::GroupOp>();
       if (!group) {
         return nullptr;

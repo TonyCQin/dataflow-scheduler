@@ -91,7 +91,7 @@ ktdf_arch.device @sample_device {
     // First sub-core.
     group  share(%l1) {
       // Compute units.
-      %sfu = group { kind = "SFU" } share() {
+      %sfu = group { kind = "SFU_Block" } share() {
          %sfp_reg = memory #SFU_REG
          %sfp_unit = exec_unit #SFU
          yield %sfp_unit
@@ -111,7 +111,7 @@ ktdf_arch.device @sample_device {
     // Second sub-core.
     group  share(%l1) {
       // Compute units.
-      %sfu = group { kind = "SFU" } share() {
+      %sfu = group { kind = "SFU_Block" } share() {
          %sfp_reg = memory #SFU_REG
          %sfp_unit = exec_unit #SFU
          yield %sfp_unit
