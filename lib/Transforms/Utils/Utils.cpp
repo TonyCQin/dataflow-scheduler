@@ -24,9 +24,9 @@
 
 #include <cassert>
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

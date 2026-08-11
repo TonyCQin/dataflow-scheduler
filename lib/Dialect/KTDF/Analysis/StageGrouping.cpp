@@ -22,11 +22,11 @@
 
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/StageGrouping.h"
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFTypes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/DebugLog.h"

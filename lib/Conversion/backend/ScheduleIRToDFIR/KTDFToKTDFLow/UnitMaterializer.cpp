@@ -18,12 +18,12 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UnitMaterializer.h"
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/Support/DebugLog.h"
 
 #define DEBUG_TYPE "ktdf-to-operand-lowering"

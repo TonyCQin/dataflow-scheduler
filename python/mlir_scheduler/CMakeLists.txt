@@ -1,5 +1,6 @@
 include_directories(SYSTEM ${DataflowSchedulerDialects_SOURCE_DIR}/include)
 include_directories(SYSTEM ${DataflowSchedulerDialects_BINARY_DIR}/include)
+include_directories(SYSTEM ${KTIR_INCLUDE_DIRS})
 
 ################################################################################
 # Generate packages and shared library

@@ -20,10 +20,10 @@
 
 #include <mlir/IR/Attributes.h>
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
 
 using namespace scheduler;

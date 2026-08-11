@@ -26,14 +26,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Ktdp/KtdpAttrs.hpp"
-#include "Ktdp/KtdpDialect.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CommandLine.h"

@@ -27,7 +27,6 @@
 
 #include <map>
 
-#include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/PipelineExecutionTransform.h"
@@ -44,6 +43,7 @@
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"

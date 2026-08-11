@@ -24,7 +24,6 @@
 
 #include <mlir/Transforms/RegionUtils.h>
 
-#include "Ktdp/KtdpDialect.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LogicalMemoryViewBuilder.h"
@@ -41,6 +40,7 @@
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"

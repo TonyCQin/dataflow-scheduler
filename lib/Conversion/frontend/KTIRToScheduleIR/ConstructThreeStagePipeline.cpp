@@ -33,8 +33,6 @@
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/Support/LLVM.h>
 
-#include "Ktdp/KtdpAttrs.hpp"
-#include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -46,6 +44,8 @@
 #include "dataflow-scheduler/Transforms/Utils/CustomLinalgTiling.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

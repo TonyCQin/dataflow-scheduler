@@ -22,9 +22,9 @@
 #include <queue>
 #include <sstream>
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"

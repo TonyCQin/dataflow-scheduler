@@ -28,9 +28,9 @@
 
 #include <optional>
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 
 #define DEBUG_TYPE "ktdf-utilities"
 

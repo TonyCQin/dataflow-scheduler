@@ -18,9 +18,9 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UniformInfra.h"
 
-#include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 

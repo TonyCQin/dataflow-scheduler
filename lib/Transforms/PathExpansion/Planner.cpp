@@ -20,11 +20,11 @@
 
 #include <llvm/Support/ErrorHandling.h>
 
-#include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/RoutingGraph.h"
 #include "dataflow-scheduler/Analysis/PipelineTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"

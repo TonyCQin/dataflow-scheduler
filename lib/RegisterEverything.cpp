@@ -42,7 +42,6 @@
 #include <mlir/IR/DialectRegistry.h>
 #include <mlir/Transforms/Passes.h>
 
-#include "Ktdp/KtdpDialect.hpp"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
@@ -55,6 +54,7 @@
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 
 using namespace scheduler;
 

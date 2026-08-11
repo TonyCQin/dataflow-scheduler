@@ -20,8 +20,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"

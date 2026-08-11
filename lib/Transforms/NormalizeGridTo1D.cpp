@@ -22,8 +22,8 @@
 
 #include <memory>
 
-#include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Transforms/Passes.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"

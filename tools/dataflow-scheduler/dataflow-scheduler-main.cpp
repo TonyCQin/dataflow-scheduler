@@ -24,9 +24,9 @@
 
 #include <filesystem>
 
-#include "Ktdp/KtdpDialect.hpp"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Process.h"

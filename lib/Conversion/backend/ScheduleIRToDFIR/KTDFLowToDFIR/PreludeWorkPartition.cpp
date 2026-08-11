@@ -18,9 +18,9 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/PreludeWorkPartition.h"
 
-#include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 using namespace scheduler;

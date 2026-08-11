@@ -29,8 +29,7 @@ add_lit_testsuite(check-dataflow-scheduler
 set_target_properties(check-dataflow-scheduler PROPERTIES FOLDER "Tests")
 add_dependencies(check-all 
   check-dataflow-scheduler 
-  check-dataflow-scheduler-dialects 
-  check-ktir
+  check-dataflow-scheduler-dialects
 )
 
 add_lit_testsuites(dataflow-scheduler 
