@@ -20,7 +20,6 @@
 #define DATAFLOW_SCHEDULER_CONVERSION_KTDFTOKTDFLOW_UNITMATERIALIZER_H_
 
 #include <map>
-#include <tuple>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
@@ -63,8 +62,8 @@ class UnitMaterializer {
 
   /// Emit dataflow.get_unit ops for memory-space components at func entry.
   /// Global spaces (memory_tree.isGlobalMemory): one unit, key core = -1.
-  /// Per-core spaces (memory_tree.isPerCoreScratchPadMemory): one unit per core
-  /// 0..grid_size-1.
+  /// Per-core spaces (memory_tree.isPerCoreScratchPadMemory ||
+  /// memory_tree.isBelowScratchPad): one unit per core 0..grid_size-1.
   mlir::LogicalResult materializeMemoryUnits(
       const llvm::SetVector<ResourceType>& needed_spaces, int grid_size,
       const scheduler::arch_view::MemoryTree& memory_tree,

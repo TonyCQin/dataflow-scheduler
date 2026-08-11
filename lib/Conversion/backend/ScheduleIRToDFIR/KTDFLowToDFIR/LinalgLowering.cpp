@@ -24,12 +24,16 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
+#include "dataflow-scheduler/Dialect/Agen/Agen.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -49,9 +53,20 @@ struct LowerLinalgGenericPattern
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const override {
+    // Buffer-semantics path: init operand is a memref accumulator.
+    if (generic_op.hasPureBufferSemantics())
+      return lowerMemRefGenericOp(generic_op, rewriter);
+
     if (!generic_op.hasPureTensorSemantics() ||
         generic_op.getNumResults() != 1) {
       return mlir::failure();
+    }
+
+    // If the generic has any reduction dimensions, delegate to the dedicated
+    // reduction lowering path before the elementwise path touches block args.
+    for (auto iter_type : generic_op.getIteratorTypesArray()) {
+      if (iter_type == mlir::utils::IteratorType::reduction)
+        return lowerReductionGenericOp(generic_op, rewriter);
     }
 
     mlir::Block& body = generic_op.getRegion().front();
@@ -60,12 +75,17 @@ struct LowerLinalgGenericPattern
       return mlir::failure();
     }
 
-    // Replace block arguments with generic inputs
+    // Replace block arguments with generic inputs.  Any input that is a
+    // constant tensor (e.g. a dense<0.0>) is converted to an equivalent
+    // arith.constant with vector type first so that vectorchain.binary always
+    // receives vector-typed operands.
     unsigned num_inputs = generic_op.getNumDpsInputs();
     for (auto [block_arg, input] :
          llvm::zip(body.getArguments().take_front(num_inputs),
                    generic_op.getDpsInputs())) {
-      block_arg.replaceAllUsesWith(input);
+      mlir::Value converted =
+          convertConstTensorInputToVector(input, generic_op, rewriter);
+      block_arg.replaceAllUsesWith(converted);
     }
 
     // Identity affine map used as op_specific_map for binary ops.
@@ -83,17 +103,35 @@ struct LowerLinalgGenericPattern
     for (mlir::Operation* op : ops_to_lower) {
       mlir::LogicalResult result =
           mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
-              // arith.mulf %lhs, %rhs -> vectorchain.binary {binary_op = mul}
-              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp mulf_op) {
-                return lowerMulFOp(mulf_op, rewriter, identity_map);
+              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::mul);
               })
-              // arith.addf %lhs, %rhs -> vectorchain.binary {binary_op = add}
-              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp addf_op) {
-                return lowerAddFOp(addf_op, rewriter, identity_map);
+              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::add);
               })
-              // arith.subf %lhs, %rhs -> vectorchain.binary {binary_op = sub}
-              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp subf_op) {
-                return lowerSubFOp(subf_op, rewriter, identity_map);
+              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::sub);
+              })
+              .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::max);
+              })
+              .Case<mlir::arith::MinimumFOp>([&](mlir::arith::MinimumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::min);
+              })
+              .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::abs_max);
               })
               .Default([](mlir::Operation* unknown_op) {
                 return unknown_op->emitError(
@@ -111,59 +149,384 @@ struct LowerLinalgGenericPattern
  private:
   arch_view::ResourceKinds& resource_kinds_;
 
-  // arith.mulf visitor: lowers to vectorchain.binary {binary_op = mul}
-  mlir::LogicalResult lowerMulFOp(mlir::arith::MulFOp mulf_op,
-                                  mlir::PatternRewriter& rewriter,
-                                  mlir::AffineMap identity_map) const {
-    auto vector_type =
-        getFlattenedVectorType(mulf_op.getLhs().getType(), resource_kinds_);
-    if (!vector_type) return mlir::failure();
+  // Lowers a linalg.generic with buffer semantics (memref init operand).
+  // The resulting accumulated vector is written back to the output buffer via
+  // agen.vector_store.
+  mlir::LogicalResult lowerMemRefGenericOp(
+      mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const {
+    mlir::Location loc = generic_op.getLoc();
 
-    auto binary_op = mlir::vectorchain::BinaryOp::create(
-        rewriter, mulf_op.getLoc(), vector_type, mulf_op.getLhs(),
-        mulf_op.getRhs(),
-        /*mask=*/nullptr, /*dbgName=*/nullptr,
-        mlir::vectorchain::VectorChainBinaryOperator::mul, identity_map);
+    mlir::Block& body = generic_op.getRegion().front();
+    auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
+    if (!yield_op || yield_op.getNumOperands() != 1) return mlir::failure();
 
-    rewriter.replaceOp(mulf_op, binary_op.getData());
+    // Replace input block arguments with their corresponding linalg ins
+    // operands.
+    unsigned num_inputs = generic_op.getNumDpsInputs();
+    for (auto [block_arg, input] :
+         llvm::zip(body.getArguments().take_front(num_inputs),
+                   generic_op.getDpsInputs()))
+      block_arg.replaceAllUsesWith(input);
+
+    // The output block argument represents the current accumulator value held
+    // in the output memref.  Emit an agen.vector_load to read it into a vector,
+    // then replace all uses of the output block arg with that loaded vector.
+    mlir::Value out_memref = generic_op.getDpsInitOperand(0)->get();
+    auto out_memref_type = mlir::cast<mlir::MemRefType>(out_memref.getType());
+    auto acc_vec_type =
+        getFlattenedVectorType(out_memref_type, resource_kinds_);
+    if (!acc_vec_type) return mlir::failure();
+    rewriter.setInsertionPoint(generic_op);
+    body.getArguments().back().replaceAllUsesWith(
+        scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
+
+    mlir::AffineMap identity_map =
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+
+    llvm::SmallVector<mlir::Operation*> ops_to_lower;
+    for (mlir::Operation& op : body.without_terminator())
+      ops_to_lower.push_back(&op);
+
+    rewriter.setInsertionPoint(generic_op);
+    for (mlir::Operation* op : ops_to_lower) {
+      mlir::LogicalResult result =
+          mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
+              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::mul);
+              })
+              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::add);
+              })
+              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::sub);
+              })
+              .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::max);
+              })
+              .Case<mlir::arith::MinimumFOp>([&](mlir::arith::MinimumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::min);
+              })
+              .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::abs_max);
+              })
+              .Default([](mlir::Operation* unknown_op) {
+                return unknown_op->emitError(
+                    "unsupported operation type in linalg.generic body");
+              });
+      if (mlir::failed(result)) return mlir::failure();
+    }
+
+    // Write the vectorchain.binary result back to the output buffer.
+    scheduler::emitVectorStore(rewriter, loc, yield_op.getOperand(0),
+                               out_memref);
+
+    rewriter.eraseOp(generic_op);
     return mlir::success();
   }
 
-  // arith.addf visitor: lowers to vectorchain.binary {binary_op = add}
-  mlir::LogicalResult lowerAddFOp(mlir::arith::AddFOp addf_op,
-                                  mlir::PatternRewriter& rewriter,
-                                  mlir::AffineMap identity_map) const {
-    auto vector_type =
-        getFlattenedVectorType(addf_op.getLhs().getType(), resource_kinds_);
-    if (!vector_type) return mlir::failure();
+  // Lowers a linalg.generic that has one or more reduction dimensions.
+  //
+  // One scf.for loop is emitted per reduction dimension (outermost first),
+  // carrying the output vector as an iter_arg accumulator.  Each innermost
+  // iteration extracts a parallel-shaped slice from the input tensor (size 1
+  // along every reduction dim, full extent along parallel dims), then
+  // accumulates it into the current accumulator via vectorchain.binary.
+  //
+  // The body op (addf / mulf / subf) determines the binary operator; the
+  // existing lowerXxxFOp helpers are reused for the accumulation step.
+  mlir::LogicalResult lowerReductionGenericOp(
+      mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const {
+    mlir::Location loc = generic_op.getLoc();
 
-    auto binary_op = mlir::vectorchain::BinaryOp::create(
-        rewriter, addf_op.getLoc(), vector_type, addf_op.getLhs(),
-        addf_op.getRhs(),
-        /*mask=*/nullptr, /*dbgName=*/nullptr,
-        mlir::vectorchain::VectorChainBinaryOperator::add, identity_map);
+    // Require exactly one body op (plus the linalg.yield terminator).
+    mlir::Block& body = generic_op.getRegion().front();
+    llvm::SmallVector<mlir::Operation*> body_ops;
+    for (mlir::Operation& op : body.without_terminator())
+      body_ops.push_back(&op);
+    if (body_ops.size() != 1)
+      return generic_op.emitError(
+          "reduction linalg.generic body must have exactly one compute op");
 
-    rewriter.replaceOp(addf_op, binary_op.getData());
+    // Map body op kind to the vectorchain binary operator.
+    mlir::vectorchain::VectorChainBinaryOperator binary_kind;
+    if (mlir::isa<mlir::arith::AddFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::add;
+    else if (mlir::isa<mlir::arith::MulFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::mul;
+    else if (mlir::isa<mlir::arith::SubFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::sub;
+    else if (mlir::isa<mlir::arith::MaximumFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::max;
+    else if (mlir::isa<mlir::arith::MinimumFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::min;
+    else if (mlir::isa<mlir::arith::MaxNumFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::abs_max;
+    else
+      return body_ops[0]->emitError(
+          "unsupported reduction body op in linalg.generic");
+
+    // Collect reduction dim indices and their sizes from the input type.
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic_op.getDpsInputOperand(0)->get().getType());
+    if (!input_type) return mlir::failure();
+
+    const auto iterator_types = generic_op.getIteratorTypesArray();
+    llvm::SmallVector<int64_t> red_dims;
+    for (int64_t i = 0; i < static_cast<int64_t>(iterator_types.size()); ++i) {
+      if (iterator_types[i] == mlir::utils::IteratorType::reduction)
+        red_dims.push_back(i);
+    }
+
+    // The output type has only parallel dims and always fits in vector_length.
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic_op.getDpsInitOperand(0)->get().getType());
+    if (!output_type) return mlir::failure();
+
+    mlir::VectorType vec_type =
+        getFlattenedVectorType(output_type, resource_kinds_);
+    if (!vec_type) return mlir::failure();
+
+    mlir::AffineMap identity_map =
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+
+    rewriter.setInsertionPoint(generic_op);
+
+    // Build the initial accumulator from the init operand.  For a tensor.empty
+    // (undefined init) use a zero vector; for a constant tensor reshape it.
+    mlir::Value init = generic_op.getDpsInitOperand(0)->get();
+    mlir::Value acc =
+        convertConstTensorInputToVector(init, generic_op, rewriter);
+    if (acc.getType() != vec_type) {
+      // Non-constant init (e.g. tensor.empty) — zero is the correct identity
+      // for reductions that start with an uninitialised accumulator.
+      acc = mlir::arith::ConstantOp::create(rewriter, loc, vec_type,
+                                            rewriter.getZeroAttr(vec_type));
+    }
+
+    // Emit one scf.for per reduction dimension (outermost first), each
+    // carrying the accumulator as its single iter_arg.
+    //
+    // The input to the linalg.generic comes from a ktdf.read_from_fifo whose
+    // result type includes all dims (parallel + reduction).  Rather than
+    // tensor.extract_slice-ing that large tensor inside the loop (which would
+    // require LowerReadFromFifoPattern to lower a tensor larger than
+    // vector_length), we instead emit one new ktdf.read_from_fifo per loop
+    // iteration — each producing the parallel-only shaped slice directly.
+    // The original read_from_fifo is replaced by the new ones so it is erased.
+    mlir::Value input = generic_op.getDpsInputOperand(0)->get();
+    auto read_from_fifo = mlir::dyn_cast_or_null<mlir::ktdf::ReadFromFifoOp>(
+        input.getDefiningOp());
+    if (!read_from_fifo)
+      return generic_op.emitError(
+          "reduction linalg.generic input must be produced by "
+          "ktdf.read_from_fifo");
+
+    // Parallel-only result type for each per-step read.
+    llvm::SmallVector<int64_t> parallel_shape;
+    for (int64_t i = 0; i < static_cast<int64_t>(iterator_types.size()); ++i) {
+      if (iterator_types[i] != mlir::utils::IteratorType::reduction)
+        parallel_shape.push_back(input_type.getShape()[i]);
+    }
+    auto parallel_type = mlir::RankedTensorType::get(
+        parallel_shape, input_type.getElementType());
+
+    mlir::Value cur_acc = acc;
+
+    // Build nested scf.for loops, one per reduction dimension.
+    llvm::SmallVector<mlir::scf::ForOp> for_ops;
+    for (int64_t red_dim : red_dims) {
+      mlir::Value lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+      mlir::Value ub = mlir::arith::ConstantIndexOp::create(
+          rewriter, loc, input_type.getShape()[red_dim]);
+      mlir::Value step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+      auto for_op = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step,
+                                             mlir::ValueRange{cur_acc});
+      for_ops.push_back(for_op);
+      rewriter.setInsertionPointToStart(for_op.getBody());
+      cur_acc = for_op.getRegionIterArgs()[0];
+    }
+
+    // Innermost body: emit a new read_from_fifo producing parallel_type,
+    // then accumulate via vectorchain.binary.
+    auto new_read = mlir::ktdf::ReadFromFifoOp::create(
+        rewriter, loc, parallel_type, read_from_fifo.getFifoSlot());
+
+    // The parallel slice fits in vector_length.
+    auto binary = mlir::vectorchain::BinaryOp::create(
+        rewriter, loc, vec_type, cur_acc, new_read.getResult(),
+        /*mask=*/nullptr, /*dbgName=*/nullptr, binary_kind, identity_map);
+
+    // Yield the new accumulator up through each loop level.
+    mlir::Value result = binary.getData();
+    for (auto for_op : llvm::reverse(for_ops)) {
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{result});
+      result = for_op.getResult(0);
+      rewriter.setInsertionPointAfter(for_op);
+    }
+
+    // Replace the linalg.generic result and erase the original read_from_fifo
+    // (which is now unused).
+    rewriter.replaceOp(generic_op, result);
+    rewriter.eraseOp(read_from_fifo);
     return mlir::success();
   }
 
-  // arith.subf visitor: lowers to vectorchain.binary {binary_op = sub}
-  mlir::LogicalResult lowerSubFOp(mlir::arith::SubFOp subf_op,
-                                  mlir::PatternRewriter& rewriter,
-                                  mlir::AffineMap identity_map) const {
-    auto vector_type =
-        getFlattenedVectorType(subf_op.getLhs().getType(), resource_kinds_);
+  /// Converts a constant tensor input of a linalg.generic to a vector-typed
+  /// arith.constant, preserving all element values.  This is needed because
+  /// linalg.generic inputs can be constant tensors (e.g. a dense<0.0>), while
+  /// vectorchain.binary requires vector operands.
+  ///
+  /// Only arith.constant ops whose value is a DenseElementsAttr are handled;
+  /// any other input (non-constant tensors, vectors, scalars) is returned
+  /// unchanged.
+  mlir::Value convertConstTensorInputToVector(
+      mlir::Value input, mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const {
+    // Only act on tensor-typed inputs — vectors and scalars pass through.
+    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(input.getType());
+    if (!tensor_type) return input;
+
+    // Must be a constant op with a dense attribute to convert.
+    auto const_op =
+        mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(input.getDefiningOp());
+    if (!const_op) return input;
+    auto dense_attr =
+        mlir::dyn_cast<mlir::DenseElementsAttr>(const_op.getValue());
+    if (!dense_attr) return input;
+
+    // Determine the target vector type (same element type, flattened shape).
+    auto vector_type = getFlattenedVectorType(tensor_type, resource_kinds_);
+    if (!vector_type) return input;
+
+    // Re-materialise the constant with the vector type, preserving all element
+    // values by reinterpreting the same dense data into the flat vector shape.
+    auto vec_attr = dense_attr.reshape(vector_type);
+    rewriter.setInsertionPoint(generic_op);
+    return mlir::arith::ConstantOp::create(rewriter, const_op.getLoc(),
+                                           vector_type, vec_attr)
+        .getResult();
+  }
+
+  // Unified helper: lowers any two-operand arith float op to
+  // vectorchain.binary with the given binary_kind.
+  mlir::LogicalResult lowerBinaryFOp(
+      mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
+      mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
+      mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
+    auto vector_type = getFlattenedVectorType(lhs.getType(), resource_kinds_);
     if (!vector_type) return mlir::failure();
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
-        rewriter, subf_op.getLoc(), vector_type, subf_op.getLhs(),
-        subf_op.getRhs(),
-        /*mask=*/nullptr, /*dbgName=*/nullptr,
-        mlir::vectorchain::VectorChainBinaryOperator::sub, identity_map);
+        rewriter, op->getLoc(), vector_type, lhs, rhs,
+        /*mask=*/nullptr, /*dbgName=*/nullptr, binary_kind, identity_map);
 
-    rewriter.replaceOp(subf_op, binary_op.getData());
+    rewriter.replaceOp(op, binary_op.getData());
     return mlir::success();
   }
+};
+
+/// Pattern to lower linalg.fill into:
+///   vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
+///   vectorchain.shuffle ... {indices = [0 : i32], repetition = N}
+///       : vector<1xT>, vector<NxT>
+///
+/// Buffer semantics (memref output): the shuffle result is written to the
+/// output memref via agen.vector_store and the fill is erased.
+///
+/// Tensor semantics (tensor output): the shuffle result directly replaces
+/// the fill result (consumed by downstream vectorchain / FIFO ops).
+///
+/// Only zero fill values are supported. N and T are derived from the output
+/// type shape and element type.
+struct LowerLinalgFillPattern
+    : public mlir::OpRewritePattern<mlir::linalg::FillOp> {
+  LowerLinalgFillPattern(mlir::MLIRContext* context,
+                         arch_view::ResourceKinds& resource_kinds)
+      : OpRewritePattern(context), resource_kinds_(resource_kinds) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::linalg::FillOp fill_op,
+      mlir::PatternRewriter& rewriter) const override {
+    // linalg.fill must have exactly one input (the fill scalar).
+    if (fill_op.getInputs().size() != 1) return mlir::failure();
+    mlir::Value fill_val = fill_op.getInputs()[0];
+    auto const_op = mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(
+        fill_val.getDefiningOp());
+    if (!const_op) return mlir::failure();
+    auto scalar_attr = mlir::dyn_cast<mlir::TypedAttr>(const_op.getValue());
+    if (!scalar_attr) return mlir::failure();
+
+    // Derive output vector type from the output operand (memref or tensor).
+    mlir::Value out_operand = fill_op.getOutputs()[0];
+    mlir::VectorType out_vec_type =
+        getFlattenedVectorType(out_operand.getType(), resource_kinds_);
+    if (!out_vec_type) return mlir::failure();
+
+    mlir::Location loc = fill_op.getLoc();
+    int64_t total_elements = out_vec_type.getNumElements();
+    mlir::Type elem_type = out_vec_type.getElementType();
+
+    rewriter.setInsertionPoint(fill_op);
+
+    // Only zero fills are supported.
+    if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(scalar_attr)) {
+      if (!fa.getValue().isZero())
+        return fill_op.emitError(
+            "linalg.fill lowering only supports zero fill values");
+    } else if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(scalar_attr)) {
+      if (!ia.getValue().isZero())
+        return fill_op.emitError(
+            "linalg.fill lowering only supports zero fill values");
+    } else {
+      return fill_op.emitError(
+          "linalg.fill constant value must be integer or float");
+    }
+
+    // Step 1: vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
+    mlir::VectorType seed_type = mlir::VectorType::get({1}, elem_type);
+    mlir::ArrayAttr value_attr = rewriter.getArrayAttr(
+        {mlir::IntegerAttr::get(rewriter.getI64Type(), 0)});
+    auto bitstream = mlir::vectorchain::ConstantBitstreamOp::create(
+        rewriter, loc, seed_type, value_attr);
+
+    // Step 2: vectorchain.shuffle — splat to vector<NxT>
+    mlir::ArrayAttr indices_attr = rewriter.getArrayAttr(
+        {mlir::IntegerAttr::get(rewriter.getI32Type(), 0)});
+    auto shuffle = mlir::vectorchain::ShuffleOp::create(
+        rewriter, loc, out_vec_type, bitstream.getResult(),
+        /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
+        /*mask=*/nullptr, /*dbgName=*/nullptr, indices_attr,
+        static_cast<uint32_t>(total_elements));
+
+    // Step 3a (tensor): replace the fill result directly with the vector.
+    if (!fill_op.getResultTensors().empty()) {
+      rewriter.replaceOp(fill_op, shuffle.getOutput());
+      return mlir::success();
+    }
+
+    // Step 3b (memref): write the filled vector into the output memref.
+    scheduler::emitVectorStore(rewriter, loc, shuffle.getOutput(), out_operand);
+
+    rewriter.eraseOp(fill_op);
+    return mlir::success();
+  }
+
+ private:
+  arch_view::ResourceKinds& resource_kinds_;
 };
 
 }  // namespace
@@ -173,4 +536,5 @@ void scheduler::populateLinalgLoweringPatterns(
     arch_view::ResourceKinds& resource_kinds) {
   patterns.add<LowerLinalgGenericPattern>(patterns.getContext(),
                                           resource_kinds);
+  patterns.add<LowerLinalgFillPattern>(patterns.getContext(), resource_kinds);
 }

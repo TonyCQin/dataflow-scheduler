@@ -3,6 +3,8 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFTransforms
     StageCoarsening/Materializer.cpp
     StageCoarsening/ScopeCorrection.cpp
     BroadcastPromotion.cpp
+    MapReductionPartials.cpp
+    ReductionLoopExposure.cpp
     StageCoarsening.cpp
     SubsumeLinearizeIndex.cpp
     TileNormalized.cpp
@@ -29,7 +31,9 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFTransforms
     MLIRAffineDialect
     MLIRArithDialect
     MLIRIR
+    MLIRLinalgDialect
     MLIRMemRefDialect
     MLIRPass
     MLIRSCFDialect
+    MLIRTensorDialect
 )

@@ -206,9 +206,6 @@ struct ConstructThreeStagePipelinePass
   // Tile sizes determined from linalg operation
   llvm::SmallVector<int64_t> tile_sizes_;
 
-  // Total number of elements (product of tile_sizes_)
-  int64_t total_num_elements_ = 0;
-
   // Operations to delete after pipeline creation
   llvm::SmallVector<mlir::Operation*> ops_to_delete_;
 
@@ -222,7 +219,6 @@ void ConstructThreeStagePipelinePass::resetState() {
   compute_ops_.clear();
   tiled_loops_.clear();
   tile_sizes_.clear();
-  total_num_elements_ = 0;
   ops_to_delete_.clear();
   const_builder_.reset();
 }
@@ -307,6 +303,29 @@ mlir::LogicalResult ConstructThreeStagePipelinePass::fuseLinalgOps(
         auto fused_op =
             mlir::cast<mlir::linalg::GenericOp>(fusion_result->fusedOp);
 
+        // Immediately after fusion: ensure every outs operand of the fused op
+        // is a fresh tensor.empty. fuseElementwiseOps can pull a live producer
+        // result into the outs position; replace it now so the rest of the
+        // pipeline always sees a clean init tensor.
+        for (int64_t i = 0, e = fused_op.getNumDpsInits(); i < e; ++i) {
+          mlir::OpOperand* init_operand = fused_op.getDpsInitOperand(i);
+          mlir::Value outs_val = init_operand->get();
+          if (mlir::isa_and_present<mlir::tensor::EmptyOp>(
+                  outs_val.getDefiningOp())) {
+            continue;  // already a tensor.empty – nothing to do
+          }
+          auto tensor_type =
+              mlir::dyn_cast<mlir::RankedTensorType>(outs_val.getType());
+          if (!tensor_type) continue;
+
+          rewriter.setInsertionPoint(fused_op);
+          auto empty = mlir::tensor::EmptyOp::create(
+              rewriter, fused_op.getLoc(), tensor_type.getShape(),
+              tensor_type.getElementType());
+          rewriter.modifyOpInPlace(
+              fused_op, [&]() { init_operand->set(empty.getResult()); });
+        }
+
         // Replace uses of consumer with the fused operation (this also erases
         // consumer)
         rewriter.replaceOp(consumer, fused_op->getResults());
@@ -328,6 +347,43 @@ mlir::LogicalResult ConstructThreeStagePipelinePass::fuseLinalgOps(
   return mlir::success();
 }
 
+// Given a shape and a target vector_length, compute per-dimension tile sizes
+// working rightmost-first until the product of covered dims reaches
+// vector_length.  Uncovered dims (leftmost) get tile size 1 so a loop is
+// generated for them; covered dims get the largest value that divides both
+// the dim size and the remaining vector-length product.
+static llvm::SmallVector<int64_t> computeTileSizesFromShape(
+    llvm::ArrayRef<int64_t> shape, int64_t vector_length) {
+  int64_t rank = shape.size();
+
+  // Find how many rightmost dims are needed to cover vector_length.
+  int64_t product = 1;
+  int64_t covered_dims = 0;
+  for (int64_t i = rank - 1; i >= 0; --i) {
+    product *= shape[i];
+    covered_dims++;
+    if (product >= vector_length) break;
+  }
+
+  llvm::SmallVector<int64_t> tile_sizes(rank);
+
+  // Uncovered dims (leftmost) get tile size 1 — a loop is generated that
+  // iterates over the full extent one element at a time.
+  for (int64_t i = 0; i < rank - covered_dims; ++i) tile_sizes[i] = 1;
+
+  // Covered dims get a size that divides both the dim and the remaining
+  // product.
+  int64_t remaining = vector_length;
+  for (int64_t i = rank - 1; i >= rank - covered_dims; --i) {
+    int64_t ts = std::min(std::gcd(shape[i], remaining), shape[i]);
+    tile_sizes[i] = ts;
+    remaining /= ts;
+    if (remaining <= 1) remaining = 1;
+  }
+
+  return tile_sizes;
+}
+
 llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::determineTileSizes(
     mlir::linalg::LinalgOp linalg_op) {
   assert(linalg_op->getNumResults() == 1 &&
@@ -345,56 +401,52 @@ llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::determineTileSizes(
   const auto vector_length =
       std::max(simd_feature.getLanes(elem_type), int64_t(1));
 
-  llvm::SmallVector<int64_t> tile_sizes;
+  // The tile-sizes vector must cover every loop dimension (getNumLoops()).
+  // Reduction dimensions are skipped (tile size = 0) so the tiling infra does
+  // not create a loop for them.  Only parallel dimensions are tiled, using the
+  // same rightmost-first shape-based algorithm as before.
+  const auto iterator_types = linalg_op.getIteratorTypesArray();
+  const int64_t num_loops = static_cast<int64_t>(iterator_types.size());
 
-  llvm::ArrayRef<int64_t> shape = shaped_type.getShape();
-  int64_t rank = shape.size();
+  // Collect the loop bounds for each dimension by querying the op directly.
+  // getStaticLoopRanges() scans all operand indexing maps so it works
+  // regardless of whether any single operand has a full-rank map (e.g. when
+  // an input has a broadcast/projection indexing map that skips some dims).
+  llvm::SmallVector<int64_t> loop_ranges = linalg_op.getStaticLoopRanges();
+  assert(static_cast<int64_t>(loop_ranges.size()) == num_loops &&
+         "getStaticLoopRanges size must match number of loops");
 
-  // Start from rightmost dimension and multiply until we reach vector_length
-  int64_t product = 1;
-  int64_t covered_dims = 0;
-
-  for (int64_t i = rank - 1; i >= 0; --i) {
-    product *= shape[i];
-    covered_dims++;
-    if (product >= vector_length) {
-      break;
+  llvm::SmallVector<int64_t> parallel_loop_indices;
+  llvm::SmallVector<int64_t> parallel_shape;
+  for (int64_t i = 0; i < num_loops; ++i) {
+    if (iterator_types[i] == mlir::utils::IteratorType::parallel) {
+      parallel_loop_indices.push_back(i);
+      parallel_shape.push_back(loop_ranges[i]);
     }
   }
 
-  // Build tile sizes: 1 for uncovered dims, partial/full for covered dims
-  tile_sizes.resize(rank);
-  for (int64_t i = 0; i < rank - covered_dims; ++i) {
-    tile_sizes[i] = 1;
-  }
+  // Compute tile sizes for the parallel dimensions.
+  llvm::SmallVector<int64_t> parallel_tile_sizes =
+      computeTileSizesFromShape(parallel_shape, vector_length);
 
-  // For covered dimensions, compute tile sizes that divide evenly
-  int64_t remaining_product = vector_length;
-  for (int64_t i = rank - 1; i >= rank - covered_dims; --i) {
-    int64_t dim_size = shape[i];
-
-    // Use GCD to find largest value that divides both dim_size and
-    // remaining_product
-    int64_t tile_size = std::gcd(dim_size, remaining_product);
-
-    // Clamp to dimension size
-    tile_size = std::min(tile_size, dim_size);
-
-    tile_sizes[i] = tile_size;
-    remaining_product /= tile_size;
-    if (remaining_product <= 1) remaining_product = 1;
-  }
+  // Assemble the final vector: 0 for reduction dims, computed size for
+  // parallel dims.
+  llvm::SmallVector<int64_t> tile_sizes(num_loops, 0);
+  for (int64_t k = 0; k < static_cast<int64_t>(parallel_loop_indices.size());
+       ++k)
+    tile_sizes[parallel_loop_indices[k]] = parallel_tile_sizes[k];
 
   LLVM_DEBUG({
-    llvm::dbgs() << "    Shape: [";
-    for (int64_t i = 0; i < rank; ++i) {
-      llvm::dbgs() << shape[i];
-      if (i < rank - 1) llvm::dbgs() << ", ";
+    llvm::dbgs() << "    Parallel shape: [";
+    for (int64_t i = 0; i < static_cast<int64_t>(parallel_shape.size()); ++i) {
+      llvm::dbgs() << parallel_shape[i];
+      if (i + 1 < static_cast<int64_t>(parallel_shape.size()))
+        llvm::dbgs() << ", ";
     }
-    llvm::dbgs() << "]\n    Tile sizes: [";
-    for (int64_t i = 0; i < rank; ++i) {
+    llvm::dbgs() << "]\n    Tile sizes (all loops): [";
+    for (int64_t i = 0; i < num_loops; ++i) {
       llvm::dbgs() << tile_sizes[i];
-      if (i < rank - 1) llvm::dbgs() << ", ";
+      if (i + 1 < num_loops) llvm::dbgs() << ", ";
     }
     llvm::dbgs() << "]\n";
   });
@@ -407,17 +459,26 @@ void ConstructThreeStagePipelinePass::annotateLoopsWithIteratorTypes(
     mlir::linalg::GenericOp generic_op) {
   assert(generic_op);
 
-  // Annotate each loop with its corresponding iterator type obtained from
-  // generic_op.
+  // The tiling infra only generates a loop for dims whose tile_size > 0.
+  // Build the ordered list of iterator types for those dims so that loops[k]
+  // maps to the k-th tiled dim (in loop-index order), not positionally to
+  // iteratorTypes[k].
   const auto& iterator_types = generic_op.getIteratorTypesArray();
-  for (size_t i = 0; i < loops.size() && i < iterator_types.size(); ++i) {
+  llvm::SmallVector<mlir::utils::IteratorType> tiled_iterator_types;
+  for (size_t i = 0; i < iterator_types.size(); ++i) {
+    if (i < tile_sizes_.size() && tile_sizes_[i] > 0)
+      tiled_iterator_types.push_back(iterator_types[i]);
+  }
+
+  for (size_t i = 0; i < loops.size() && i < tiled_iterator_types.size(); ++i) {
     auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(loops[i]);
     assert(for_op);
 
     mlir::ktdf::LoopType loop_type;
-    if (iterator_types[i] == mlir::utils::IteratorType::parallel) {
+    if (tiled_iterator_types[i] == mlir::utils::IteratorType::parallel) {
       loop_type = mlir::ktdf::LoopType::ParallelLoop;
-    } else if (iterator_types[i] == mlir::utils::IteratorType::reduction) {
+    } else if (tiled_iterator_types[i] ==
+               mlir::utils::IteratorType::reduction) {
       loop_type = mlir::ktdf::LoopType::ReductionLoop;
     } else {
       for_op->emitError("Unsupported iterator type");
@@ -459,17 +520,10 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
       return;
     }
 
-    // Calculate total number of elements (product of tile_sizes_)
-    total_num_elements_ = 1;
-    for (int64_t dim : tile_sizes_) {
-      total_num_elements_ *= dim;
-    }
-
     LLVM_DEBUG({
       llvm::dbgs() << "  Tile sizes: ";
       for (int64_t i : tile_sizes_) llvm::dbgs() << i << ", ";
       llvm::dbgs() << "\n";
-      llvm::dbgs() << "  Total num elements: " << total_num_elements_ << "\n";
     });
 
     // Tile the linalg.generic operation with the computed tile sizes
@@ -526,46 +580,59 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
                   llvm::SmallVector<mlir::ktdf::FifoSlotType>>
       fifo_type_groups;
 
-  // Add FIFO slot types for load operations
-  for (mlir::ktdp::LoadOp load_op : load_ops_) {
-    auto tensor_type =
-        mlir::dyn_cast<mlir::RankedTensorType>(load_op.getResult().getType());
-    if (!tensor_type) {
-      load_op.emitError("Expected RankedTensorType result from ktdp.load");
+  // Add FIFO slot types for load operations.
+  // The FIFO must hold one per-iteration tile of the input.  compute_ops_[0]
+  // is the tiled linalg inside the loop body; its DPS input operand types are
+  // already the tiled shapes, so use them directly.
+  assert(compute_ops_.size() == 1 &&
+         "expected exactly one linalg compute op after fusion");
+  for (size_t i = 0; i < load_ops_.size(); ++i) {
+    mlir::ktdp::LoadOp load_op = load_ops_[i];
+    auto tiled_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        compute_ops_[0].getDpsInputOperand(i)->get().getType());
+    if (!tiled_type) {
+      load_op.emitError("Expected RankedTensorType for tiled linalg input");
       signalPassFailure();
       return nullptr;
     }
-    mlir::Type element_type = tensor_type.getElementType();
+    int64_t num_elements = 1;
+    for (int64_t dim : tiled_type.getShape()) num_elements *= dim;
+    mlir::Type element_type = tiled_type.getElementType();
 
     // Get FIFO attributes for this specific load operation
     auto [load_src, load_dest] = getFifoAttributesForLoad(load_op);
     auto load_key = std::make_pair(load_src, load_dest);
 
     auto fifo_slot_type = mlir::ktdf::FifoSlotType::get(
-        &getContext(), load_src, load_dest, total_num_elements_, element_type);
+        &getContext(), load_src, load_dest, num_elements, element_type);
     fifo_type_groups[load_key].push_back(fifo_slot_type);
     private_result_types.push_back(fifo_slot_type);
   }
 
-  // Add FIFO slot types for store operations
-  for (mlir::ktdp::StoreOp store_op : store_ops_) {
-    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(
-        store_op.getDataTile().getType());
-    if (!tensor_type) {
+  // Add FIFO slot types for store operations.
+  // Size from the tiled linalg DPS init operand type so that write_to_fifo
+  // (stage 2) and data_transfer (stage 3) agree on the per-iteration tile
+  // size.
+  for (size_t i = 0; i < store_ops_.size(); ++i) {
+    mlir::ktdp::StoreOp store_op = store_ops_[i];
+    auto tiled_init_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        compute_ops_[0].getDpsInitOperand(i)->get().getType());
+    if (!tiled_init_type) {
       store_op.emitError(
-          "Expected RankedTensorType data operand in ktdp.store");
+          "Expected RankedTensorType for tiled linalg init operand");
       signalPassFailure();
       return nullptr;
     }
-    mlir::Type element_type = tensor_type.getElementType();
+    int64_t num_elements = 1;
+    for (int64_t dim : tiled_init_type.getShape()) num_elements *= dim;
+    mlir::Type element_type = tiled_init_type.getElementType();
 
     // Get FIFO attributes for this specific store operation
     auto [store_src, store_dest] = getFifoAttributesForStore(store_op);
     auto store_key = std::make_pair(store_src, store_dest);
 
-    auto fifo_slot_type =
-        mlir::ktdf::FifoSlotType::get(&getContext(), store_src, store_dest,
-                                      total_num_elements_, element_type);
+    auto fifo_slot_type = mlir::ktdf::FifoSlotType::get(
+        &getContext(), store_src, store_dest, num_elements, element_type);
     fifo_type_groups[store_key].push_back(fifo_slot_type);
     private_result_types.push_back(fifo_slot_type);
   }
@@ -781,41 +848,66 @@ static std::optional<mlir::AffineMap> findIndexingMapForStoreSource(
   return std::nullopt;
 }
 
-// Project tile_sizes through indexing_map to produce one entry per result
-// dim of the map. Sizes are derived per result expr:
-//   - AffineDimExpr  d_k  -> tile_sizes[k]   (projection of one iterator dim)
-//   - AffineConstantExpr -> 1                (broadcast/squeeze: that source
-//                                             dim is accessed at a fixed index)
-// Other expressions (e.g. d0 + d1) are not currently supported and produce
-// an error.
-static mlir::LogicalResult projectSizesThroughIndexingMap(
+// Return a compressed version of indexing_map suitable for use in a
+// data_transfer op, together with the filtered set of loop IVs to pass as
+// its dim operands.
+//
+// Two kinds of dims are removed from the domain:
+//   1. Reduction dims (tile_sizes[k] == 0): substituted with constant 0,
+//      then dropped because they are no longer referenced.
+//   2. Parallel dims that do not appear in any result of this particular
+//      operand's indexing map (e.g. a broadcast input that skips a loop dim):
+//      also dropped by compressUnusedDims.
+//
+// loop_ivs must have one entry per tiled dim (tile_sizes[k] > 0), in
+// loop-index order.  The returned map_ivs contains only the subset of
+// loop_ivs that correspond to dims surviving compression.
+static mlir::AffineMap buildDataTransferMap(
     mlir::AffineMap indexing_map, llvm::ArrayRef<int64_t> tile_sizes,
-    llvm::SmallVectorImpl<int64_t>& projected_sizes,
-    mlir::function_ref<mlir::InFlightDiagnostic()> emit_error) {
-  assert(indexing_map.getNumSymbols() == 0 &&
-         "linalg indexing maps are expected to have no symbols");
-  assert(indexing_map.getNumDims() == tile_sizes.size() &&
-         "indexing map dims must match the iteration-space rank");
+    llvm::ArrayRef<mlir::Value> loop_ivs,
+    llvm::SmallVectorImpl<mlir::Value>& map_ivs) {
+  assert(indexing_map.getNumSymbols() == 0);
+  assert(indexing_map.getNumDims() == tile_sizes.size());
 
-  for (mlir::AffineExpr result : indexing_map.getResults()) {
-    if (auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(result)) {
-      projected_sizes.push_back(tile_sizes[dim.getPosition()]);
-      continue;
-    }
-    if (mlir::isa<mlir::AffineConstantExpr>(result)) {
-      projected_sizes.push_back(1);
-      continue;
-    }
-    std::string buf;
-    llvm::raw_string_ostream os(buf);
-    result.print(os);
-    emit_error()
-        << "operand indexing map has an unsupported result expression (" << buf
-        << "); only single-dim projections and constant indices are "
-           "supported";
-    return mlir::failure();
+  mlir::MLIRContext* ctx = indexing_map.getContext();
+
+  // Step 1: substitute reduction dims with constant 0.
+  llvm::SmallVector<mlir::AffineExpr> replacements;
+  replacements.reserve(tile_sizes.size());
+  for (unsigned k = 0; k < tile_sizes.size(); ++k) {
+    if (tile_sizes[k] > 0)
+      replacements.push_back(mlir::getAffineDimExpr(k, ctx));
+    else
+      replacements.push_back(mlir::getAffineConstantExpr(0, ctx));
   }
-  return mlir::success();
+  mlir::AffineMap substituted = indexing_map.replaceDimsAndSymbols(
+      replacements, {}, indexing_map.getNumDims(), 0);
+
+  // Step 2: drop dims that are now unused (reduction dims become constant 0
+  // and are gone; parallel dims not referenced in any result are also gone).
+  mlir::AffineMap compressed = mlir::compressUnusedDims(substituted);
+
+  // Step 3: build map_ivs — the loop IVs for the dims that survived.
+  // loop_ivs has one entry per tiled dim (tile_sizes[k] > 0), in order.
+  // A tiled dim k survives iff AffineDimExpr(k) still appears in substituted
+  // (i.e. it appears in at least one result of the original indexing_map).
+  llvm::SmallBitVector survives(tile_sizes.size(), false);
+  for (mlir::AffineExpr result : indexing_map.getResults()) {
+    result.walk([&](mlir::AffineExpr e) {
+      if (auto d = mlir::dyn_cast<mlir::AffineDimExpr>(e))
+        if (tile_sizes[d.getPosition()] > 0)  // only parallel dims have an IV
+          survives.set(d.getPosition());
+    });
+  }
+  unsigned iv_idx = 0;
+  for (unsigned k = 0; k < tile_sizes.size(); ++k) {
+    if (tile_sizes[k] > 0) {
+      if (survives.test(k)) map_ivs.push_back(loop_ivs[iv_idx]);
+      ++iv_idx;
+    }
+  }
+
+  return compressed;
 }
 
 void ConstructThreeStagePipelinePass::createDataTransfers(
@@ -836,9 +928,6 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
 
   // Get the appropriate operation list
   size_t op_count = is_load ? load_ops_.size() : store_ops_.size();
-
-  // FIFO slot size is the product of tile_sizes (i.e. total_num_elements_)
-  llvm::SmallVector<int64_t> fifo_sizes = {total_num_elements_};
 
   const auto compute_kind = resource_kinds_->getComputeKind();
   if (!compute_kind) {
@@ -883,9 +972,6 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
     return;
   }
 
-  assert(total_num_elements_ <= max_in &&
-         "FIFO slot size exceeds maximum allowed size for compute unit");
-
   // The post-fusion linalg op whose indexing_maps describe how each
   // load/store operand maps onto the iteration space.
   assert(compute_ops_.size() == 1 &&
@@ -922,31 +1008,85 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
       return;
     }
 
-    // Project tile_sizes through the operand's indexing map.
-    llvm::SmallVector<int64_t> access_tile_sizes;
-    if (mlir::failed(projectSizesThroughIndexingMap(
-            *indexing_map, tile_sizes, access_tile_sizes,
-            [&]() { return err_anchor->emitError(); }))) {
+    // Build the data_transfer map and the matching IV list.
+    llvm::SmallVector<mlir::Value> map_ivs;
+    mlir::AffineMap substituted_map =
+        buildDataTransferMap(*indexing_map, tile_sizes, loop_ivs, map_ivs);
+
+    // Compute the per-operand transfer sizes by projecting tile_sizes through
+    // the (full, pre-compression) indexing map.  For a parallel dim d_k the
+    // result expression is AffineDimExpr(k) and the projected size is
+    // tile_sizes[k].  For a reduction dim tile_sizes[k] == 0 so we fall back
+    // to the full dim extent from the access tile shape.
+    auto access_tile_type =
+        mlir::dyn_cast<mlir::ktdp::AccessTileType>(access_tile_value.getType());
+    if (!access_tile_type) {
+      err_anchor->emitError("access tile operand is not an AccessTileType");
       signalPassFailure();
       return;
+    }
+    llvm::ArrayRef<int64_t> full_shape = access_tile_type.getShape();
+
+    llvm::SmallVector<int64_t> access_tile_sizes;
+    access_tile_sizes.reserve(indexing_map->getNumResults());
+    for (mlir::AffineExpr result_expr : indexing_map->getResults()) {
+      if (auto dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(result_expr)) {
+        unsigned k = dim_expr.getPosition();
+        // Parallel dim: use the tile size.
+        // Reduction dim (tile_sizes[k] == 0): use the full dim extent.
+        int64_t ts = tile_sizes[k];
+        access_tile_sizes.push_back(
+            ts > 0 ? ts : full_shape[access_tile_sizes.size()]);
+      } else if (mlir::isa<mlir::AffineConstantExpr>(result_expr)) {
+        // Broadcast/squeezed dim: size is 1.
+        access_tile_sizes.push_back(1);
+      } else {
+        err_anchor->emitError(
+            "unsupported affine expression in operand indexing map for "
+            "data_transfer size computation");
+        signalPassFailure();
+        return;
+      }
     }
 
     // Get the FIFO slot from ktdf.private results.
     mlir::Value fifo_slot = private_op.getResult(private_result_offset + i);
 
-    // The fifo side gets a null AffineMap; the access-tile (memref) side
-    // gets the linalg operand's indexing map directly. loop_ivs feeds the
-    // map's dim inputs.
+    // For a load, the FIFO must hold the full input tile — including any
+    // reduction dimensions — because the compute stage reads a tensor of that
+    // full shape from the FIFO.  fifo_sizes therefore mirrors
+    // access_tile_sizes.
+    //
+    // For a store, the output tile contains only parallel dimensions, so
+    // reduction dims (tile_sizes[k] == 0) are absent from the output indexing
+    // map and must not appear in fifo_sizes.
+    llvm::SmallVector<int64_t> fifo_sizes;
+    if (is_load) {
+      fifo_sizes.assign(access_tile_sizes.begin(), access_tile_sizes.end());
+    } else {
+      for (mlir::AffineExpr result_expr : indexing_map->getResults()) {
+        if (auto dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(result_expr)) {
+          unsigned k = dim_expr.getPosition();
+          if (tile_sizes[k] > 0) fifo_sizes.push_back(tile_sizes[k]);
+        } else if (mlir::isa<mlir::AffineConstantExpr>(result_expr)) {
+          fifo_sizes.push_back(1);
+        }
+      }
+    }
+
+    // The fifo side gets a null AffineMap; the access-tile (memref) side gets
+    // the substituted+compressed map. map_ivs has exactly one entry per dim
+    // that survived compression.
     mlir::AffineMap null_map;
     if (is_load) {
       mlir::ktdf::DataTransferOp::create(builder, loc, access_tile_value,
-                                         *indexing_map, loop_ivs,
+                                         substituted_map, map_ivs,
                                          access_tile_sizes, fifo_slot, null_map,
                                          mlir::ValueRange{}, fifo_sizes);
     } else {
       mlir::ktdf::DataTransferOp::create(
           builder, loc, fifo_slot, null_map, mlir::ValueRange{}, fifo_sizes,
-          access_tile_value, *indexing_map, loop_ivs, access_tile_sizes);
+          access_tile_value, substituted_map, map_ivs, access_tile_sizes);
     }
   }
 }
@@ -1033,6 +1173,25 @@ void ConstructThreeStagePipelinePass::createComputeOps(
   if (linalg_op && linalg_op.getNumDpsInits() > 0) {
     mlir::Value output_operand = linalg_op.getDpsInitOperand(0)->get();
     mapper.map(output_operand, empty_tensor.getResult());
+  }
+
+  // Any linalg op input not already remapped
+  // that is defined by a tensor.extract_slice in the enclosing loop body
+  // cannot be used inside the stage nested region (would result in use before
+  // definition). Clone the extract_slice inside the stage so the cloned linalg
+  // can reference it legally.
+  if (linalg_op) {
+    for (mlir::OpOperand* input : linalg_op.getDpsInputOperands()) {
+      mlir::Value v = input->get();
+      if (mapper.contains(v)) continue;
+      auto extract_op = v.getDefiningOp<mlir::tensor::ExtractSliceOp>();
+      if (!extract_op) continue;
+      // Clone the extract_slice at the current insertion point (inside the
+      // stage), mapping its operands through the existing mapper so that any
+      // loop IVs etc. resolve correctly.
+      auto* cloned_extract = builder.clone(*extract_op, mapper);
+      mapper.map(v, cloned_extract->getResult(0));
+    }
   }
 
   auto* cloned = builder.clone(*compute_op, mapper);
@@ -1192,23 +1351,30 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     return;
   }
 
-  // Find the insertion point: right before the first loop in tiled_loops_
-  // to ensure def before use
-  mlir::Operation* insertion_point = nullptr;
-  if (!tiled_loops_.empty()) {
-    insertion_point = tiled_loops_.front();
-  } else {
-    // Fallback: find the last memory view operation
-    func_op.walk([&](mlir::ktdp::ConstructMemoryViewOp memory_view) {
-      insertion_point = memory_view.getOperation();
-    });
+  // Hoist construct_memory_view and construct_access_tile ops to just before
+  // the outermost tiled loop (or the func terminator if no loops exist).
+  // This ensures both the memory views and the access tiles — and therefore the
+  // memory_space_cast / reinterpret_cast we are about to emit in their place —
+  // all precede the pipeline that consumes them.
+  // We use the outermost tiled loop as the insertion anchor because that is
+  // where the pipeline lives; everything hoisted before it will dominate all
+  // uses inside the loop body.
+  mlir::Operation* hoist_before = tiled_loops_.empty()
+                                      ? func_op.front().getTerminator()
+                                      : tiled_loops_.front();
+  {
+    // Hoist memory views first (access tiles depend on them).
+    llvm::SmallVector<mlir::ktdp::ConstructMemoryViewOp> mem_views;
+    func_op.walk(
+        [&](mlir::ktdp::ConstructMemoryViewOp mv) { mem_views.push_back(mv); });
+    for (auto mv : mem_views) {
+      mv->moveBefore(hoist_before);
+    }
   }
-
-  if (!insertion_point) {
-    func_op.emitError(
-        "No insertion point found for reinterpret_cast operations");
-    signalPassFailure();
-    return;
+  // Hoist access tiles themselves so that inserting the casts before each
+  // access tile (below) also lands before the pipeline.
+  for (auto at : access_tiles) {
+    at->moveBefore(hoist_before);
   }
 
   mlir::OpBuilder builder(&getContext());
@@ -1259,12 +1425,12 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
       }
     }
 
-    builder.setInsertionPoint(insertion_point);
+    // Insert the cast sequence immediately before the (now-hoisted)
+    // construct_access_tile.  Both the memory view and index operands have
+    // already been moved above the outermost loop, so all operands dominate
+    // this insertion point.
+    builder.setInsertionPoint(access_tile);
     mlir::Location loc = access_tile.getLoc();
-
-    // Move the memory view operation right before the insertion point to ensure
-    // it dominates the reinterpret_cast
-    memory_view.getDefiningOp()->moveBefore(insertion_point);
 
     // Apply base_map to materialize one index per source-memref dimension.
     // Operands to expandAffineMap are dim-values followed by symbol-values; the

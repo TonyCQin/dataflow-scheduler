@@ -19,6 +19,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
@@ -32,6 +33,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 
 using namespace scheduler;
@@ -67,31 +69,91 @@ std::optional<int64_t> scheduler::getVectorLanes(
       int64_t(1));
 }
 
+mlir::IntegerSet scheduler::buildIntegerSetFromSizes(
+    mlir::MLIRContext* ctx, llvm::ArrayRef<int64_t> sizes) {
+  llvm::SmallVector<mlir::AffineExpr> exprs;
+  llvm::SmallVector<bool> eq_flags;
+  for (unsigned i = 0; i < sizes.size(); ++i) {
+    auto dim = mlir::getAffineDimExpr(i, ctx);
+    int64_t size = sizes[i];
+    if (size == 1) {
+      exprs.push_back(dim);
+      eq_flags.push_back(/*equality=*/true);
+    } else {
+      exprs.push_back(dim);
+      eq_flags.push_back(false);
+      exprs.push_back(mlir::getAffineConstantExpr(size - 1, ctx) - dim);
+      eq_flags.push_back(false);
+    }
+  }
+  return mlir::IntegerSet::get(sizes.size(), 0, exprs, eq_flags);
+}
+
+mlir::Value scheduler::emitVectorLoad(mlir::OpBuilder& builder,
+                                      mlir::Location loc,
+                                      mlir::VectorType vec_type,
+                                      mlir::Value memref) {
+  auto memref_type = mlir::cast<mlir::MemRefType>(memref.getType());
+  unsigned rank = memref_type.getRank();
+  mlir::MLIRContext* ctx = builder.getContext();
+  auto map = mlir::AffineMap::getMultiDimIdentityMap(rank, ctx);
+  auto load_set = buildIntegerSetFromSizes(ctx, memref_type.getShape());
+  llvm::SmallVector<mlir::Value> zero_indices(
+      rank, mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  return mlir::agen::VectorLoadOp::create(builder, loc, vec_type, memref,
+                                          /*dbgName=*/nullptr, map,
+                                          zero_indices, load_set, map)
+      .getResult();
+}
+
+void scheduler::emitVectorStore(mlir::OpBuilder& builder, mlir::Location loc,
+                                mlir::Value value, mlir::Value memref) {
+  auto memref_type = mlir::cast<mlir::MemRefType>(memref.getType());
+  unsigned rank = memref_type.getRank();
+  mlir::MLIRContext* ctx = builder.getContext();
+  auto map = mlir::AffineMap::getMultiDimIdentityMap(rank, ctx);
+  auto store_set = buildIntegerSetFromSizes(ctx, memref_type.getShape());
+  llvm::SmallVector<mlir::Value> zero_indices(
+      rank, mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::agen::VectorStoreOp::create(builder, loc, value, memref,
+                                    /*dbgName=*/nullptr, map, zero_indices,
+                                    store_set, map);
+}
+
 mlir::VectorType scheduler::getFlattenedVectorType(
     mlir::Type type, arch_view::ResourceKinds& resource_kinds) {
   // FIXME: Get this info from somewhere else.
 
+  llvm::ArrayRef<int64_t> shape;
+  mlir::Type elem_type;
+
   if (auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
-    int64_t total_elements = 1;
-    for (auto dim : tensor_type.getShape()) {
-      total_elements *= dim;
-    }
-
-    auto elem_type = tensor_type.getElementType();
-    const auto max_vector_length = getVectorLanes(elem_type, resource_kinds);
-    if (!max_vector_length) {
-      return nullptr;
-    }
-
-    assert(total_elements <= *max_vector_length &&
-           "Flattened tensor size exceeds maximum vector length");
-
-    return mlir::VectorType::get({total_elements}, elem_type);
-  }
-  if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(type)) {
+    shape = tensor_type.getShape();
+    elem_type = tensor_type.getElementType();
+  } else if (auto memref_type = mlir::dyn_cast<mlir::MemRefType>(type)) {
+    shape = memref_type.getShape();
+    elem_type = memref_type.getElementType();
+  } else if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(type)) {
     return vector_type;
+  } else {
+    return nullptr;
   }
-  return nullptr;
+
+  int64_t total_elements = 1;
+  for (auto dim : shape) total_elements *= dim;
+
+  const auto compute_kind = resource_kinds.getComputeKind();
+  if (!compute_kind) return nullptr;
+
+  const auto max_vector_length = std::max(
+      resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(compute_kind)
+          .getLanes(elem_type),
+      int64_t(1));
+
+  assert(total_elements <= max_vector_length &&
+         "Flattened tensor/memref size exceeds maximum vector length");
+
+  return mlir::VectorType::get({total_elements}, elem_type);
 }
 
 mlir::Value scheduler::createQueryMapForComponent(

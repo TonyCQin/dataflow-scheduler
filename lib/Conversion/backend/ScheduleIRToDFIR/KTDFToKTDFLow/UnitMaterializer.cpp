@@ -126,7 +126,6 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
   auto loc = func_.getLoc();
 
   for (auto mspace_attr : needed_spaces) {
-    // Get string name from the attribute by printing it
     std::string space_name;
     llvm::raw_string_ostream os(space_name);
     mspace_attr.print(os);
@@ -147,9 +146,15 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
             type_tag);
         get_unit_op->setAttr("core", builder.getI32IntegerAttr(core));
         memory_unit_ssa[{mspace_attr, core}] = get_unit_op.getUnit();
-        LDBG(1) << "  Created per-core memory unit for " << space_name
-                << " core " << core;
+        LDBG(1) << "  Created memory unit for " << space_name << " core "
+                << core;
       }
+    } else if (memory_tree.isBelowScratchPad(mspace_attr)) {
+      auto get_unit_op = mlir::dataflow::GetUnitOp::create(
+          builder, loc, mlir::TypeRange{builder.getIndexType()}, type_tag,
+          type_tag);
+      memory_unit_ssa[{mspace_attr, -1}] = get_unit_op.getUnit();
+      LDBG(1) << "  Created below-scratchpad memory unit for " << space_name;
     } else {
       return func_.emitError("Unknown memory space classification for: ")
              << space_name;

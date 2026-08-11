@@ -35,39 +35,6 @@ using namespace scheduler;
 
 namespace {
 
-/// Helper to build IntegerSet from static size array
-/// Size of 1 corresponds to dk = 0, other sizes n correspond to 0 <= dk <= n-1
-mlir::IntegerSet buildIntegerSetFromSizes(mlir::MLIRContext* context,
-                                          llvm::ArrayRef<int64_t> sizes) {
-  if (sizes.empty()) {
-    return mlir::IntegerSet::getEmptySet(0, 0, context);
-  }
-
-  llvm::SmallVector<mlir::AffineExpr, 4> exprs;
-  llvm::SmallVector<bool, 4> eq_flags;
-
-  for (unsigned i = 0; i < sizes.size(); ++i) {
-    auto dim = mlir::getAffineDimExpr(i, context);
-    int64_t size = sizes[i];
-
-    if (size == 1) {
-      // Size 1: dk = 0
-      exprs.push_back(dim);
-      eq_flags.push_back(true);
-    } else {
-      // Size n: 0 <= dk <= n-1
-      // This means: dk >= 0 and dk <= n-1
-      exprs.push_back(dim);  // dk >= 0
-      eq_flags.push_back(false);
-      exprs.push_back(mlir::getAffineConstantExpr(size - 1, context) -
-                      dim);  // n-1 - dk >= 0
-      eq_flags.push_back(false);
-    }
-  }
-
-  return mlir::IntegerSet::get(sizes.size(), 0, exprs, eq_flags);
-}
-
 /// Create a vectorchain.shuffle that broadcasts src_vec (vector<src_elements x
 /// T>) to vector<dst_elements x T> using indices [0..src_elements-1] repeated
 /// (dst_elements / src_elements) times.
@@ -88,9 +55,11 @@ mlir::Value insertSplatShuffle(mlir::PatternRewriter& rewriter,
   auto result_type = mlir::VectorType::get({dst_elements}, elem_type);
 
   return mlir::vectorchain::ShuffleOp::create(
-             rewriter, loc, result_type, src_vec, indices_attr,
-             rewriter.getI32IntegerAttr(repetition),
-             /*dbgName=*/nullptr)
+             rewriter, loc, result_type, src_vec,
+             /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
+             /*mask=*/nullptr,
+             /*dbgName=*/nullptr, indices_attr,
+             rewriter.getI32IntegerAttr(repetition))
       .getOutput();
 }
 
@@ -213,10 +182,6 @@ struct LowerDataTransferPattern
             "splat/pad transfer");
         return mlir::failure();
       }
-    } else if (src_total_elements != dst_total_elements) {
-      data_transfer_op.emitError(
-          "source and destination total elements must match");
-      return mlir::failure();
     }
 
     int64_t total_elements = dst_total_elements;
@@ -382,8 +347,10 @@ struct LowerDataTransferPattern
     }
 
     // Build src_load_set / dst_store_set from the per-vector sizes.
-    auto src_load_set = buildIntegerSetFromSizes(context, load_sizes);
-    auto dst_store_set = buildIntegerSetFromSizes(context, store_sizes);
+    auto src_load_set =
+        scheduler::buildIntegerSetFromSizes(context, load_sizes);
+    auto dst_store_set =
+        scheduler::buildIntegerSetFromSizes(context, store_sizes);
 
     // load_order and store_order must match their respective set
     // dimensionality.
@@ -397,7 +364,7 @@ struct LowerDataTransferPattern
     llvm::SmallVector<int64_t> time_extents = src_time_dims.extents;
     if (time_extents.empty()) time_extents.push_back(1);
     const unsigned num_time_dims = time_extents.size();
-    auto time_set = buildIntegerSetFromSizes(context, time_extents);
+    auto time_set = scheduler::buildIntegerSetFromSizes(context, time_extents);
     // time_order: identity. Correct because the walked dimensions above are
     // listed slowest-varying first, so time dimension 0 is already the
     // outermost and the last time dimension the innermost/fastest-varying.

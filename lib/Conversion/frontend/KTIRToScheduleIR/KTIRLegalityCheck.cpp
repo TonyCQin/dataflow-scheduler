@@ -91,7 +91,7 @@ struct KTIRLegalityCheckPass
 
       // Rule 2: compute ops.
       // 2a: named linalg ops (anything in the linalg dialect that is not a
-      // generic/yield). Allow add/mul/sub; reject other named ops.
+      // generic/yield). Allow add/mul/sub/reduce; reject other named ops.
       if (op->getDialect() ==
           op->getContext()->getLoadedDialect<mlir::linalg::LinalgDialect>()) {
         if (mlir::isa<mlir::linalg::GenericOp>(op)) {
@@ -114,13 +114,14 @@ struct KTIRLegalityCheckPass
           return mlir::WalkResult::skip();
         }
         if (mlir::isa<mlir::linalg::AddOp, mlir::linalg::MulOp,
-                      mlir::linalg::SubOp, mlir::linalg::YieldOp>(op)) {
+                      mlir::linalg::SubOp, mlir::linalg::ReduceOp,
+                      mlir::linalg::YieldOp>(op)) {
           return mlir::WalkResult::advance();
         }
         // Any other named linalg op is unsupported.
         op->emitError(
-            "V1 only supports add/mul/sub compute ops; found unsupported "
-            "compute op");
+            "V1 only supports add/mul/sub/reduce compute ops; found "
+            "unsupported compute op");
         failed = true;
         return mlir::WalkResult::interrupt();
       }
